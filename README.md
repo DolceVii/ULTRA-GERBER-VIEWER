@@ -8,8 +8,6 @@ The project is designed for real-world PCB inspection, CAM review, Gerber analys
 
 ## Preview
 
-Add your clean application screenshot here:
-
 ```markdown
 ![ULTRA GERBER VIEWER](screenshots/ui.png)
 ```
