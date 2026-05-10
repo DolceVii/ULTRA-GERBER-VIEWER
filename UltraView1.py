@@ -10,7 +10,7 @@ Install:
     pip install PyQt6
 
 Run:
-    python ultra_gerber_viewer_by_george_kourtidis.py
+    python UktraView1.py
 
 Keys:
     F     FIT
