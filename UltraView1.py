@@ -3,7 +3,7 @@
 """
 ULTRA GERBER VIEWER by George Kourtidis
 Pure Python 3 + PyQt6
-Version v2.42 REALISTIC PTH GOLD RINGS / 1.5MM PCB
+Version v1
 NO gerbv, NO external renderer.
 
 Install:
