@@ -10,7 +10,7 @@ Install:
     pip install PyQt6
 
 Run:
-    python UktraView1.py
+    python UltraView1.py
 
 Keys:
     F     FIT
@@ -905,7 +905,28 @@ class ExcellonParser:
         text = Path(path).read_text(errors="ignore")
         lines = text.splitlines()
 
-        self.kicad_decimal_inch = ("KICAD" in text.upper() and "INCH" in text.upper() and "DECIMAL" in text.upper())
+        name = Path(path).name.upper()
+        head = text[:200000].upper()
+        self.kicad_decimal_inch = ("KICAD" in head and "INCH" in head and "DECIMAL" in head)
+
+        # Altium Designer commonly exports drill/slot files as *.TXT with
+        # METRIC,TZ coordinates but without an explicit FILE_FORMAT line.
+        # In that case the coordinate format is normally 2:4 / 4 decimal
+        # places.  The old parser defaulted METRIC to 3 decimals, so values
+        # like X127651/Y549295 became 127.651/549.295 mm instead of
+        # 12.7651/54.9295 mm, which throws RoundHoles/SlotHoles far outside
+        # the PCB.
+        self.altium_txt_metric_hint = (
+            Path(path).suffix.upper() == ".TXT"
+            and (
+                "ALTIUM" in head
+                or "ROUNDHOLES" in name
+                or "SLOTHOLES" in name
+                or "PLATED" in name
+                or "NONPLATED" in name
+                or "NON-PLATED" in name
+            )
+        )
 
         prims = self._parse_lines(lines)
 
@@ -917,6 +938,8 @@ class ExcellonParser:
             self.info = "Excellon inch auto format: 1.5 / 5 decimals"
         else:
             extra = " KiCad decimal-inch" if getattr(self, "kicad_decimal_inch", False) else ""
+            if getattr(self, "altium_txt_metric_hint", False) and self.unit == "mm" and self.decimals == 4:
+                extra += " Altium TXT metric 2:4"
             self.info = f"Excellon {self.unit} decimals={self.decimals}{extra}"
 
         return prims
@@ -957,7 +980,7 @@ class ExcellonParser:
             if "METRIC" in line:
                 self.unit = "mm"
                 if not self.format_locked:
-                    self.decimals = 3
+                    self.decimals = 4 if getattr(self, "altium_txt_metric_hint", False) else 3
             if "INCH" in line or "M72" in line:
                 self.unit = "inch"
 
@@ -4135,7 +4158,208 @@ class MainWindow(QMainWindow):
                 self.log_msg(f"ERROR {name}: {type(e).__name__}: {e}")
                 self.log_msg(traceback.format_exc(limit=2))
 
+        self.auto_align_outside_drill_layers()
         self.render_visible()
+
+
+    def auto_align_outside_drill_layers(self):
+        """Auto-correct real Excellon drill hit layers by registration, not by bbox center.
+
+        The previous fix translated a wrong-origin drill cloud to the board bbox center.
+        That is too crude: a connector-heavy PCB often has drill hits only on one side,
+        so its bbox center is *not* the board center.  This version extracts pad/via
+        centres from copper/pad layers and finds the translation that makes the most
+        drill centres coincide with real copper pad centres.  TXT Excellon files are
+        allowed here; only documentation/table-like TXT layers are ignored when they
+        do not contain a normal drill cloud.
+        """
+        if len(self.layers) < 2:
+            return
+
+        board_ref = self.renderer.main_board_reference(self.layers).normalized()
+        if not board_ref.isValid() or board_ref.width() <= 0 or board_ref.height() <= 0:
+            return
+
+        board_span = max(board_ref.width(), board_ref.height(), 1.0)
+        board_ext = QRectF(board_ref).adjusted(-8.0, -8.0, 8.0, 8.0)
+
+        def prim_center_and_size(prim: Primitive):
+            try:
+                if prim.kind == "circle" and prim.points:
+                    c = prim.points[0]
+                    return c.x(), c.y(), max(float(prim.radius) * 2.0, 0.001)
+                if prim.kind in ("rect", "obround") and prim.points:
+                    c = prim.points[0]
+                    w, h = prim.rect or (0.2, 0.2)
+                    return c.x(), c.y(), max(float(w), float(h), 0.001)
+                if prim.kind == "polygon" and len(prim.points) >= 3:
+                    r = QPolygonF(prim.points).boundingRect().normalized()
+                    if r.isValid():
+                        return r.center().x(), r.center().y(), max(r.width(), r.height(), 0.001)
+            except Exception:
+                return None
+            return None
+
+        # Pad/via targets.  Do not use line centres; tracks would create false matches.
+        pad_targets = []
+        for layer in self.layers:
+            if not layer.visible:
+                continue
+            if str(getattr(layer, "layer_type", "")).lower() == "drill":
+                continue
+            lname = layer.name.lower()
+            if not any(k in lname for k in ("copper", "pads", "signal", "top", "bottom")):
+                continue
+            if self.renderer.is_wireframe_visual_layer_name(lname):
+                continue
+            for prim in layer.primitives:
+                cs = prim_center_and_size(prim)
+                if cs is None:
+                    continue
+                x, y, size = cs
+                if size < 0.08 or size > 8.0:
+                    continue
+                if not board_ext.contains(QPointF(x, y)):
+                    continue
+                pad_targets.append((x, y, size))
+
+        if len(pad_targets) < 6:
+            return
+
+        # Spatial hash for fast nearest-pad tests.
+        cell = 0.25
+        grid = {}
+        for x, y, size in pad_targets:
+            key = (int(round(x / cell)), int(round(y / cell)))
+            grid.setdefault(key, []).append((x, y, size))
+
+        def has_target(x, y, drill_dia):
+            gx, gy = int(round(x / cell)), int(round(y / cell))
+            tol = max(0.13, min(0.45, drill_dia * 0.80))
+            tol2 = tol * tol
+            for ix in range(gx - 2, gx + 3):
+                for iy in range(gy - 2, gy + 3):
+                    for px, py, psz in grid.get((ix, iy), ()):  # small local bucket
+                        # Pad must be at least comparable to the hole.
+                        if psz + 0.20 < drill_dia:
+                            continue
+                        dx = x - px
+                        dy = y - py
+                        if dx * dx + dy * dy <= tol2:
+                            return True
+            return False
+
+        def is_real_drill_cloud(layer: Layer, drills: list) -> bool:
+            if len(drills) >= 3:
+                return True
+            # A true drill table/report usually contains long drawing geometry, not only flashes.
+            base = layer.name.lower()
+            report_words = ("read", "legend", "table", "chart", "map", "report")
+            return not any(w in base for w in report_words)
+
+        def move_layer(layer: Layer, dx: float, dy: float):
+            def move_pt(pt: QPointF):
+                pt.setX(pt.x() + dx)
+                pt.setY(pt.y() + dy)
+
+            for prim in layer.primitives:
+                for pt in getattr(prim, "points", []) or []:
+                    move_pt(pt)
+                for contour in getattr(prim, "contours", None) or []:
+                    for pt in contour:
+                        move_pt(pt)
+                for attr in (
+                    "_fast_path_cache", "_solid_stroke_cache", "_solid_stroke_cache_key",
+                    "_fast_region_path_cache", "_fast_polygon_cache"
+                ):
+                    if hasattr(prim, attr):
+                        delattr(prim, attr)
+            for attr in ("_fast_bounds_cache", "_viewport_candidate_cache"):
+                if hasattr(layer, attr):
+                    delattr(layer, attr)
+            layer.bbox = self.renderer.layer_bounds(layer)
+
+        for layer in self.layers:
+            if str(getattr(layer, "layer_type", "")).lower() != "drill":
+                continue
+
+            drills = []
+            for prim in layer.primitives:
+                if prim.kind == "circle" and prim.points:
+                    c = prim.points[0]
+                    drills.append((c.x(), c.y(), max(float(prim.radius) * 2.0, 0.05)))
+                elif prim.kind == "line" and len(prim.points) >= 2:
+                    p1, p2 = prim.points[0], prim.points[1]
+                    drills.append((p1.x(), p1.y(), max(float(prim.width), 0.05)))
+                    drills.append((p2.x(), p2.y(), max(float(prim.width), 0.05)))
+
+            if not is_real_drill_cloud(layer, drills):
+                continue
+
+            b = self.renderer.layer_bounds(layer).normalized()
+            if not b.isValid() or b.width() <= 0 or b.height() <= 0:
+                continue
+
+            # Generate candidate translations from drill->pad pairs.  Quantizing
+            # collapses thousands of similar offsets into one robust vote bucket.
+            sample_drills = drills[:120]
+            sample_targets = pad_targets[:2500]
+            q = 0.02
+            votes = {}
+            for dx0, dy0, dd in sample_drills:
+                for px, py, psz in sample_targets:
+                    if psz + 0.20 < dd:
+                        continue
+                    dx = px - dx0
+                    dy = py - dy0
+                    # Reject absurd shifts that would throw the cloud far away.
+                    if abs(dx) > board_span * 4.0 or abs(dy) > board_span * 4.0:
+                        continue
+                    key = (round(dx / q), round(dy / q))
+                    votes[key] = votes.get(key, 0) + 1
+
+            if not votes:
+                continue
+
+            # Score only the strongest offset hypotheses.
+            best = None
+            for key, _ in sorted(votes.items(), key=lambda kv: kv[1], reverse=True)[:80]:
+                dx = key[0] * q
+                dy = key[1] * q
+                hits = 0
+                for x, y, dd in drills:
+                    if has_target(x + dx, y + dy, dd):
+                        hits += 1
+                ratio = hits / max(len(drills), 1)
+                # Prefer more matches; secondarily prefer smaller movement.
+                score = (hits, ratio, -math.hypot(dx, dy))
+                if best is None or score > best[0]:
+                    best = (score, dx, dy, hits, ratio)
+
+            if best is None:
+                continue
+
+            _, dx, dy, hits, ratio = best
+            already_hits = sum(1 for x, y, dd in drills if has_target(x, y, dd))
+            min_hits = max(5, min(18, int(len(drills) * 0.10)))
+
+            # Apply only when it is clearly better than current placement.
+            if hits < min_hits or hits <= already_hits + 3:
+                continue
+            if abs(dx) < 0.03 and abs(dy) < 0.03:
+                continue
+
+            move_layer(layer, dx, dy)
+            layer.info = f"PAD-MATCHED DRILL dx={dx:.3f} dy={dy:.3f} mm hits={hits}/{len(drills)} | " + layer.info
+            self.log_msg(f"PAD-MATCHED drill layer {layer.name}: dx={dx:.3f} mm dy={dy:.3f} mm hits={hits}/{len(drills)}")
+
+            for r in range(self.table.rowCount()):
+                item = self.table.item(r, 2)
+                if item and item.data(Qt.ItemDataRole.UserRole) is layer:
+                    info_item = self.table.item(r, 3)
+                    if info_item:
+                        info_item.setText(layer.info)
+                    break
 
     def add_row(self, layer: Layer):
         self._block_table = True
@@ -6444,6 +6668,247 @@ def _ugv_open_3d_viewer(self, mode: str = "both"):
 
 MainWindow.menu = _ugv_menu_with_3d
 MainWindow.open_3d_viewer = _ugv_open_3d_viewer
+
+
+# -----------------------------------------------------------------------------
+# FINAL Altium drill TXT registration fix
+# -----------------------------------------------------------------------------
+# Altium exports real NC drill files as text files such as
+#   *RoundHoles-Plated.TXT
+#   *SlotHoles-Plated.TXT
+# These are not drill legends/tables.  Older heuristics treated every .TXT as a
+# helper/table layer, so SlotHoles/RoundHoles bypassed the PCB outlier filter and
+# stayed at the Altium absolute NC origin.  The code below treats these files as
+# real drill layers and performs a stronger pad-registration pass.
+
+_UGV_PREV_IS_DRILL_LEGEND_OR_TABLE = RasterRenderer.is_drill_legend_or_table_layer_name
+
+def _ugv_is_drill_legend_or_table_layer_name_final(name: str) -> bool:
+    n = str(name).lower().replace('\\', '/')
+    base = n.rsplit('/', 1)[-1]
+    # Real Altium NC drill exports.  They must be aligned to pads, not rendered
+    # as remote helper drawings.
+    if any(tok in base for tok in (
+        'roundholes-plated', 'roundholes-nonplated', 'slotholes-plated', 'slotholes-nonplated',
+        'round_holes', 'slot_holes', 'roundholes', 'slotholes'
+    )):
+        return False
+    # Only report/legend/table TXT files are helper layers.  Do not blanket-match .txt.
+    if base.endswith('.txt'):
+        return any(tok in base for tok in (
+            'read', 'readme', 'report', 'legend', 'table', 'chart', 'map', 'drawing', 'status', 'transcode'
+        ))
+    return _UGV_PREV_IS_DRILL_LEGEND_OR_TABLE(name)
+
+RasterRenderer.is_drill_legend_or_table_layer_name = staticmethod(_ugv_is_drill_legend_or_table_layer_name_final)
+
+
+def _ugv_drill_bbox_and_points(layer):
+    drills = []
+    for prim in getattr(layer, 'primitives', []) or []:
+        if prim.kind == 'circle' and prim.points:
+            c = prim.points[0]
+            drills.append((c.x(), c.y(), max(float(prim.radius) * 2.0, 0.05)))
+        elif prim.kind == 'line' and len(prim.points) >= 2:
+            p1, p2 = prim.points[0], prim.points[1]
+            d = max(float(getattr(prim, 'width', 0.0) or 0.0), 0.05)
+            drills.append((p1.x(), p1.y(), d))
+            drills.append((p2.x(), p2.y(), d))
+        elif prim.kind == 'polyline' and len(prim.points) >= 2:
+            d = max(float(getattr(prim, 'width', 0.0) or 0.0), 0.05)
+            for pt in prim.points:
+                drills.append((pt.x(), pt.y(), d))
+    return drills
+
+
+def _ugv_move_layer_geometry_final(layer, dx: float, dy: float):
+    def mv(pt):
+        pt.setX(pt.x() + dx)
+        pt.setY(pt.y() + dy)
+    for prim in getattr(layer, 'primitives', []) or []:
+        for pt in getattr(prim, 'points', []) or []:
+            mv(pt)
+        for contour in getattr(prim, 'contours', None) or []:
+            for pt in contour:
+                mv(pt)
+        for attr in ('_fast_path_cache', '_solid_stroke_cache', '_solid_stroke_cache_key', '_fast_region_path_cache', '_fast_polygon_cache'):
+            if hasattr(prim, attr):
+                try: delattr(prim, attr)
+                except Exception: pass
+    for attr in ('_fast_bounds_cache', '_viewport_candidate_cache'):
+        if hasattr(layer, attr):
+            try: delattr(layer, attr)
+            except Exception: pass
+
+
+def _ugv_prim_pad_center_size_final(prim):
+    try:
+        if prim.kind == 'circle' and prim.points:
+            c = prim.points[0]
+            return c.x(), c.y(), max(float(prim.radius) * 2.0, 0.05)
+        if prim.kind in ('rect', 'obround') and prim.points:
+            c = prim.points[0]
+            w, h = prim.rect or (0.0, 0.0)
+            return c.x(), c.y(), max(float(w), float(h), 0.05)
+        if prim.kind == 'polygon' and len(prim.points) >= 3:
+            b = QPolygonF(prim.points).boundingRect().normalized()
+            if b.width() <= 10.0 and b.height() <= 10.0:
+                c = b.center()
+                return c.x(), c.y(), max(b.width(), b.height(), 0.05)
+        if prim.kind == 'region' and getattr(prim, 'contours', None):
+            path = QPainterPath()
+            first = True
+            for cont in prim.contours:
+                if not cont: continue
+                if first:
+                    path.moveTo(cont[0]); first = False
+                else:
+                    path.moveTo(cont[0])
+                for pt in cont[1:]: path.lineTo(pt)
+            b = path.boundingRect().normalized()
+            if b.width() <= 10.0 and b.height() <= 10.0:
+                c = b.center()
+                return c.x(), c.y(), max(b.width(), b.height(), 0.05)
+    except Exception:
+        return None
+    return None
+
+
+def _ugv_auto_align_outside_drill_layers_final(self):
+    # First run the previous aligner; then repair the remaining Altium TXT drill
+    # clouds that are still outside the board.
+    try:
+        _UGV_PREV_AUTO_ALIGN_OUTSIDE_DRILL_LAYERS(self)
+    except Exception as e:
+        try: self.log_msg(f'Previous drill aligner warning: {e}')
+        except Exception: pass
+
+    if not getattr(self, 'layers', None):
+        return
+
+    board_ref = self.renderer.main_board_reference(self.layers).normalized()
+    if not board_ref.isValid() or board_ref.width() <= 0 or board_ref.height() <= 0:
+        board_ref = self.renderer.bounds([l for l in self.layers if getattr(l, 'visible', True)]).normalized()
+    if not board_ref.isValid() or board_ref.width() <= 0 or board_ref.height() <= 0:
+        return
+    board_ext = QRectF(board_ref).adjusted(-8.0, -8.0, 8.0, 8.0)
+
+    targets = []
+    for layer in self.layers:
+        typ = str(getattr(layer, 'layer_type', '')).lower()
+        if typ in {'drill', 'drillmap', 'mechanical', 'assembly', '3d'}:
+            continue
+        lname = layer.name.lower()
+        if not any(k in lname for k in ('copper', 'pad', 'signal', 'top', 'bottom')):
+            continue
+        for prim in getattr(layer, 'primitives', []) or []:
+            cs = _ugv_prim_pad_center_size_final(prim)
+            if not cs: continue
+            x, y, sz = cs
+            if 0.10 <= sz <= 9.0 and board_ext.contains(QPointF(x, y)):
+                targets.append((x, y, sz))
+    if len(targets) < 4:
+        return
+
+    cell = 0.45
+    grid = {}
+    for x, y, sz in targets:
+        grid.setdefault((int(round(x / cell)), int(round(y / cell))), []).append((x, y, sz))
+
+    def hit(x, y, dia):
+        gx, gy = int(round(x / cell)), int(round(y / cell))
+        tol = max(0.20, min(1.10, dia * 1.10))
+        t2 = tol * tol
+        for ix in range(gx - 3, gx + 4):
+            for iy in range(gy - 3, gy + 4):
+                for px, py, psz in grid.get((ix, iy), ()): 
+                    if psz + 0.35 < dia:
+                        continue
+                    dx = x - px; dy = y - py
+                    if dx * dx + dy * dy <= t2:
+                        return True
+        return False
+
+    for layer in self.layers:
+        if str(getattr(layer, 'layer_type', '')).lower() != 'drill':
+            continue
+        lname = layer.name.lower()
+        is_altium_txt = any(tok in lname for tok in ('roundholes', 'slotholes', 'slot_holes', 'round_holes'))
+        drills = _ugv_drill_bbox_and_points(layer)
+        if not drills:
+            continue
+        b = self.renderer.layer_bounds(layer).normalized()
+        if not b.isValid():
+            continue
+        already = sum(1 for x, y, d in drills if hit(x, y, d))
+        outside = not board_ext.intersects(b) and not board_ext.contains(b.center())
+        if already >= max(3, int(len(drills) * 0.35)) and not outside:
+            continue
+
+        # Strong exhaustive vote.  This is intentionally for the small Altium NC
+        # TXT files too; SlotHoles may only have a handful of endpoints.
+        q = 0.01
+        votes = {}
+        d_sample = drills[:300]
+        for dx0, dy0, dd in d_sample:
+            for px, py, psz in targets:
+                if psz + 0.35 < dd:
+                    continue
+                dx = px - dx0; dy = py - dy0
+                # Altium NC absolute origins can be hundreds of mm away; accept
+                # that, but reject insane drawings/reports.
+                if abs(dx) > 1500.0 or abs(dy) > 1500.0:
+                    continue
+                key = (round(dx / q), round(dy / q))
+                votes[key] = votes.get(key, 0) + 1
+        if not votes:
+            continue
+        best = None
+        for key, vote in sorted(votes.items(), key=lambda kv: kv[1], reverse=True)[:180]:
+            dx = key[0] * q; dy = key[1] * q
+            hits = sum(1 for x, y, d in drills if hit(x + dx, y + dy, d))
+            ratio = hits / max(len(drills), 1)
+            # Small drill files need an absolute hit count rule; large drill files
+            # need ratio too.  Distance is only a tie-breaker.
+            score = (hits, ratio, vote, -math.hypot(dx, dy))
+            if best is None or score > best[0]:
+                best = (score, dx, dy, hits, ratio)
+        if not best:
+            continue
+        _, dx, dy, hits, ratio = best
+        needed = 2 if len(drills) <= 12 else max(4, int(len(drills) * 0.12))
+        if is_altium_txt:
+            needed = min(needed, 3)
+        if hits < needed or hits <= already:
+            # Last safety fallback for Altium TXT only: if it is still completely
+            # outside, move the cloud near the board center instead of letting it
+            # pollute the canvas.  This fallback is visible in INFO so it cannot
+            # be confused with pad-verified alignment.
+            if is_altium_txt and outside:
+                dx = board_ref.center().x() - b.center().x()
+                dy = board_ref.center().y() - b.center().y()
+                _ugv_move_layer_geometry_final(layer, dx, dy)
+                layer.bbox = self.renderer.layer_bounds(layer)
+                layer.info = f'CENTERED ALTIUM DRILL TXT dx={dx:.3f} dy={dy:.3f} mm | ' + layer.info
+                try: self.log_msg(f'CENTERED Altium TXT drill layer {layer.name}: dx={dx:.3f} dy={dy:.3f} mm')
+                except Exception: pass
+            continue
+        if abs(dx) < 0.005 and abs(dy) < 0.005:
+            continue
+        _ugv_move_layer_geometry_final(layer, dx, dy)
+        layer.bbox = self.renderer.layer_bounds(layer)
+        layer.info = f'FINAL PAD-MATCHED ALTIUM DRILL dx={dx:.3f} dy={dy:.3f} mm hits={hits}/{len(drills)} | ' + layer.info
+        try: self.log_msg(f'FINAL PAD-MATCHED Altium drill layer {layer.name}: dx={dx:.3f} dy={dy:.3f} mm hits={hits}/{len(drills)}')
+        except Exception: pass
+
+    try:
+        self.populate_table()
+    except Exception:
+        pass
+
+
+_UGV_PREV_AUTO_ALIGN_OUTSIDE_DRILL_LAYERS = MainWindow.auto_align_outside_drill_layers
+MainWindow.auto_align_outside_drill_layers = _ugv_auto_align_outside_drill_layers_final
 
 def main():
     app = QApplication(sys.argv)
