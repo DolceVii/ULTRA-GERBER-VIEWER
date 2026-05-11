@@ -1588,6 +1588,24 @@ class RasterRenderer:
         )) or ("mechanical" in n and "profile" not in n)
 
     @staticmethod
+    def is_text_hole_layer_name(name: str) -> bool:
+        """Layers where old Altium/Protel text may be exported as separate filled polygons.
+
+        Some legacy Altium CAM outputs do not keep the inner loops of letters
+        (O, R, B, 8, 6, 9, P, D) inside the same Gerber region.  Instead the
+        outer and inner shapes arrive as independent polygons/regions. If each
+        primitive is painted separately, the inner holes are filled.  On text
+        layers we therefore paint polygon/region text geometry as one
+        OddEvenFill film, like CAMtastic/GerbView.
+        """
+        n = name.lower().replace("\\", "/")
+        base = n.rsplit("/", 1)[-1]
+        return any(k in n for k in (
+            "silk", "legend", "designator", "overlay", "topsilk", "bottomsilk",
+            "top_silk", "bottom_silk", "topoverlay", "bottomoverlay",
+        )) or base.endswith((".gto", ".gbo", ".sst", ".ssb", ".plc", ".pls"))
+
+    @staticmethod
     def is_fab_filled_layer_name(name: str) -> bool:
         """Real fabrication layers that are allowed to be filled."""
         n = name.lower()
@@ -1784,6 +1802,24 @@ class RasterRenderer:
 
             draw_clear_for_primitive(prim)
 
+    def primitive_fill_path_for_text_holes(self, prim: Primitive) -> QPainterPath:
+        """Return filled geometry for old-Altium text hole reconstruction."""
+        path = QPainterPath()
+        path.setFillRule(Qt.FillRule.OddEvenFill)
+
+        if prim.kind == "polygon" and len(prim.points) >= 3:
+            sub = QPainterPath()
+            sub.addPolygon(QPolygonF(prim.points))
+            sub.closeSubpath()
+            path.addPath(sub)
+
+        elif prim.kind == "region" and prim.contours:
+            rp = self.cached_region_path(prim)
+            rp.setFillRule(Qt.FillRule.OddEvenFill)
+            path.addPath(rp)
+
+        return path
+
     def draw_layer(self, p: QPainter, layer: Layer, board_ref: Optional[QRectF] = None):
         lname = layer.name.lower()
 
@@ -1828,7 +1864,49 @@ class RasterRenderer:
         else:
             draw_indices = range(len(layer.primitives))
 
+        # OLD ALTIUM TEXT FIX ONLY:
+        # Do not change drill alignment, layer positions, camera, copper or pads.
+        # This only fixes filled letters on text/silkscreen/designator layers.
+        # Legacy Altium often exports letter holes as separate polygons, so
+        # drawing every polygon independently fills O/R/B/8/6/9/P/D.  We combine
+        # only polygon/region text geometry into one OddEvenFill path.
+        combined_text_path = QPainterPath()
+        combined_text_path.setFillRule(Qt.FillRule.OddEvenFill)
+        combined_text_indices = set()
+        use_combined_text_holes = self.is_text_hole_layer_name(lname) and not wireframe_visual
+
+        if use_combined_text_holes:
+            for idx in draw_indices:
+                prim = layer.primitives[idx]
+                if prim.kind not in {"polygon", "region"}:
+                    continue
+                pb = bounds_cache[idx] if idx < len(bounds_cache) else self.primitive_bounds(prim)
+                if lod_px > 0.0 and pb.isValid():
+                    if max(pb.width(), pb.height()) * screen_px_per_mm < lod_px:
+                        continue
+                if (
+                    not getattr(self, "_export_no_heuristic_filter", False)
+                    and board_ref is not None
+                    and not self.primitive_allowed_bounds(layer, pb, board_ref)
+                ):
+                    continue
+                sub = self.primitive_fill_path_for_text_holes(prim)
+                if not sub.isEmpty():
+                    combined_text_path.addPath(sub)
+                    combined_text_indices.add(idx)
+
+            if not combined_text_path.isEmpty():
+                old_mode = p.compositionMode()
+                p.setCompositionMode(QPainter.CompositionMode.CompositionMode_SourceOver)
+                p.setPen(Qt.PenStyle.NoPen)
+                p.setBrush(QBrush(base_color))
+                # Keep AA here; text must stay smooth.  OddEvenFill opens the holes.
+                p.drawPath(combined_text_path)
+                p.setCompositionMode(old_mode)
+
         for idx in draw_indices:
+            if idx in combined_text_indices:
+                continue
             prim = layer.primitives[idx]
             pb = bounds_cache[idx] if idx < len(bounds_cache) else self.primitive_bounds(prim)
 
@@ -2083,10 +2161,10 @@ class RasterRenderer:
         for contour in prim.contours:
             if len(contour) < 3:
                 continue
-            path.moveTo(contour[0])
-            for pt in contour[1:]:
-                path.lineTo(pt)
-            path.closeSubpath()
+            sub = QPainterPath()
+            sub.addPolygon(QPolygonF(contour))
+            sub.closeSubpath()
+            path.addPath(sub)
         return path
 
 
